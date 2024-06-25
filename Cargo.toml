@@ -4,5 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.86"
 clap = { version = "4.5.7", features = ["derive"] }
+fork = "0.1.23"
+rkyv = { version = "0.7.44", features = ["validation"] }
+smol = "2.0.0"
 zbus = "4.3.0"
