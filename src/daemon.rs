@@ -1,8 +1,4 @@
-use std::{
-    io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
-    time::Duration,
-};
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::{get_socket_path, Signal};
 use anyhow::{bail, Result};
@@ -39,18 +35,14 @@ async fn handle_connection(
     proxy1: &SystemdProxy<'_>,
     fd: &mut Option<OwnedFd>,
 ) -> Result<()> {
-    let mut buf: Vec<u8> = vec![0; 64];
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    let bytes = stream.read(&mut buf)?;
-    let request = rkyv::from_bytes::<Signal>(&buf[..bytes]);
-    match request {
+    match Signal::from_reader(stream) {
         Err(_) => bail!("Failed to deserialize request"),
         Ok(s) => match s {
             Signal::Query => {
                 if fd.is_some() {
-                    send(stream, Signal::On)
+                    Signal::On.to_writer(stream)
                 } else {
-                    send(stream, Signal::Off)
+                    Signal::Off.to_writer(stream)
                 }
             }
             Signal::On => {
@@ -60,19 +52,12 @@ async fn handle_connection(
                         .await?;
                     *fd = Some(new_fd);
                 }
-                send(stream, Signal::On)
+                Signal::On.to_writer(stream)
             }
             Signal::Off => {
                 *fd = None;
-                send(stream, Signal::Off)
+                Signal::Off.to_writer(stream)
             }
         },
     }
-}
-
-fn send(stream: &mut UnixStream, signal: Signal) -> Result<()> {
-    let msg = rkyv::to_bytes::<_, 64>(&signal)?;
-    stream.write_all(&msg)?;
-    stream.flush()?;
-    Ok(())
 }

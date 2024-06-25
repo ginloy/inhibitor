@@ -30,6 +30,37 @@ enum Signal {
     Off,
 }
 
+impl Signal {
+    fn to_writer<W>(&self, writer: &mut W) -> Result<()>
+    where
+        W: Write,
+    {
+        let bytes = rkyv::to_bytes::<_, 64>(self)?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn from_reader<R>(reader: &mut R) -> Result<Signal>
+    where
+        R: Read,
+    {
+        let mut buf: Vec<u8> = vec![0; 64];
+        let bytes_read = reader.read(&mut buf)?;
+        if bytes_read == 0 {
+            bail!("EOF")
+        }
+        let res = rkyv::from_bytes::<Signal>(&buf[..bytes_read]);
+        match res {
+            Ok(s) => anyhow::Result::Ok(s),
+            Err(e) => {
+                buf[..bytes_read].chain(reader);
+                bail!("Failed to deserialize bytes to Signal: {}", e)
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
     let signal = args.command.unwrap_or(Signal::Query);
@@ -77,17 +108,9 @@ fn get_stream() -> Result<UnixStream> {
 }
 
 fn send(stream: &mut UnixStream, signal: Signal) -> Result<Signal> {
-    let msg = rkyv::to_bytes::<_, 64>(&signal)?;
-    stream.write_all(&msg)?;
-    stream.flush()?;
-    let mut buf: Vec<u8> = vec![0; 64];
+    signal.to_writer(stream)?;
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    let bytes = stream.read(&mut buf)?;
-    if bytes == 0 {
-        bail!("No response from daemon");
-    }
-    let x = rkyv::from_bytes::<Signal>(&buf[..bytes]);
-    match x {
+    match Signal::from_reader(stream) {
         Ok(x) => Ok(x),
         Err(_) => bail!("Failed to deserialize response"),
     }
