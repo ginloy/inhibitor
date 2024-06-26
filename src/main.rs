@@ -1,16 +1,17 @@
-use std::{
-    io::{Read, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
+use codec::SignalCodec;
 use daemon::start;
 use fork::Fork;
+use futures::SinkExt;
 use rkyv::{Archive, Deserialize, Serialize};
+use tokio::{net::UnixStream, time::timeout};
+use tokio_stream::StreamExt;
+use tokio_util::codec::Framed;
 
+mod codec;
 mod daemon;
 
 #[derive(Parser, Debug)]
@@ -19,9 +20,9 @@ struct Cli {
     command: Option<Signal>,
 }
 
-#[derive(Subcommand, Debug, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Archive, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[archive(check_bytes, compare(PartialEq))]
-enum Signal {
+pub enum Signal {
     /// Query for inhibitor state
     Query,
     /// Activate idle inhibition
@@ -30,69 +31,45 @@ enum Signal {
     Off,
 }
 
-impl Signal {
-    fn to_writer<W>(&self, writer: &mut W) -> Result<()>
-    where
-        W: Write,
-    {
-        let bytes = rkyv::to_bytes::<_, 64>(self)?;
-        writer.write_all(&bytes)?;
-        writer.flush()?;
-        Ok(())
-    }
-
-    fn from_reader<R>(reader: &mut R) -> Result<Signal>
-    where
-        R: Read,
-    {
-        let mut buf: Vec<u8> = vec![0; 64];
-        let bytes_read = reader.read(&mut buf)?;
-        if bytes_read == 0 {
-            bail!("EOF")
-        }
-        let res = rkyv::from_bytes::<Signal>(&buf[..bytes_read]);
-        match res {
-            Ok(s) => anyhow::Result::Ok(s),
-            Err(e) => {
-                buf[..bytes_read].chain(reader);
-                bail!("Failed to deserialize bytes to Signal: {}", e)
-            }
-        }
-    }
-}
-
 fn main() -> Result<()> {
     let args = Cli::parse();
     let signal = args.command.unwrap_or(Signal::Query);
-    match get_stream() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    match check_socket() {
         Err(_) => match fork::fork() {
             Ok(Fork::Child) => {
                 // let _ = fork::close_fd();
-                smol::block_on(start())
+                start()
             }
             Ok(Fork::Parent(_)) => {
                 // println!("Daemon started with pid {c}");
-                std::thread::sleep(Duration::from_millis(200));
-                let mut stream = get_stream()?;
-                handle_signal(&mut stream, signal)?;
-                Ok(())
+                runtime.block_on(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let mut stream = get_stream().await?;
+                    handle_signal(&mut stream, signal).await?;
+                    Ok(())
+                })
             }
             Err(e) => {
                 bail!("Failed to start daemon: {e}");
             }
         },
-        Ok(mut stream) => {
-            handle_signal(&mut stream, signal)?;
+        Ok(_) => runtime.block_on(async {
+            let mut stream = get_stream().await?;
+            handle_signal(&mut stream, signal).await?;
             Ok(())
-        }
+        }),
     }
 }
 
-fn handle_signal(stream: &mut UnixStream, signal: Signal) -> Result<()> {
-    let reply = send(stream, signal)?;
+async fn handle_signal(stream: &mut Framed<UnixStream, SignalCodec>, signal: Signal) -> Result<()> {
+    let reply = send(stream, signal).await?;
     match reply {
-        Signal::On => println!("Idle inhibition ON"),
-        Signal::Off => println!("Idle inhibition OFF"),
+        Signal::On => println!("ON"),
+        Signal::Off => println!("OFF"),
         _ => bail!("Unknown reply from daemon"),
     }
     Ok(())
@@ -103,15 +80,19 @@ fn get_socket_path() -> Result<PathBuf> {
     Ok(runtime_dir.join("inhibitor.sock"))
 }
 
-fn get_stream() -> Result<UnixStream> {
-    Ok(UnixStream::connect(get_socket_path()?)?)
+async fn get_stream() -> Result<Framed<UnixStream, SignalCodec>> {
+    let stream = UnixStream::connect(get_socket_path()?).await?;
+    Ok(Framed::new(stream, SignalCodec {}))
 }
 
-fn send(stream: &mut UnixStream, signal: Signal) -> Result<Signal> {
-    signal.to_writer(stream)?;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    match Signal::from_reader(stream) {
-        Ok(x) => Ok(x),
-        Err(_) => bail!("Failed to deserialize response"),
-    }
+fn check_socket() -> Result<()> {
+    Ok(std::os::unix::net::UnixStream::connect(get_socket_path()?).map(|_| ())?)
+}
+
+async fn send(stream: &mut Framed<UnixStream, SignalCodec>, signal: Signal) -> Result<Signal> {
+    stream.send(signal).await?;
+    let reply = timeout(Duration::from_secs(2), stream.next()).await?;
+    reply
+        .map(|e| Ok(e?))
+        .unwrap_or(Err(anyhow!("No response from daemon")))
 }

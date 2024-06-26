@@ -1,7 +1,11 @@
-use std::os::unix::net::{UnixListener, UnixStream};
-
+use crate::codec::SignalCodec;
 use crate::{get_socket_path, Signal};
-use anyhow::{bail, Result};
+use anyhow::Result;
+use futures::sink::SinkExt;
+use futures::StreamExt;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::codec::Framed;
 use zbus::{proxy, zvariant::OwnedFd};
 
 #[proxy(
@@ -13,51 +17,127 @@ trait Systemd {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
 }
 
+enum Command {
+    Query(oneshot::Sender<Result<bool>>),
+    Inhibit(oneshot::Sender<Result<()>>),
+    Uninhibit(oneshot::Sender<Result<()>>),
+}
+struct Inhibitor {
+    connection: zbus::Connection,
+    fd: Option<OwnedFd>,
+    receiver: mpsc::UnboundedReceiver<Command>,
+}
+
+impl Inhibitor {
+    async fn run(&mut self) {
+        let proxy = SystemdProxy::new(&self.connection)
+            .await
+            .expect("Unable to get dbus proxy");
+        while let Some(cmd) = self.receiver.recv().await {
+            let _ = self.handle_command(cmd, &proxy).await;
+        }
+    }
+
+    async fn handle_command(&mut self, cmd: Command, proxy: &SystemdProxy<'_>) {
+        match cmd {
+            Command::Query(ch) => {
+                let _ = ch.send(Ok(self.fd.is_some()));
+            }
+            Command::Inhibit(ch) => {
+                self.fd = proxy
+                    .inhibit("idle", "inhibitor", "User request", "block")
+                    .await
+                    .ok();
+
+                let _ = ch.send(Ok(()));
+            }
+            Command::Uninhibit(ch) => {
+                self.fd = None;
+                let _ = ch.send(Ok(()));
+            }
+        }
+    }
+
+    async fn new_handler() -> InhibitorHandler {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let connection = zbus::Connection::system()
+            .await
+            .expect("Failed to connect to system dbus");
+        let mut inhibitor = Inhibitor {
+            connection,
+            fd: None,
+            receiver,
+        };
+        tokio::spawn(async move { inhibitor.run().await });
+        InhibitorHandler { sender }
+    }
+}
+
+#[derive(Clone)]
+struct InhibitorHandler {
+    sender: mpsc::UnboundedSender<Command>,
+}
+
+impl InhibitorHandler {
+    async fn query(&self) -> Result<bool> {
+        let (send, receive) = oneshot::channel();
+        let _ = self.sender.send(Command::Query(send));
+        receive.await?
+    }
+    async fn inhibit(&self) -> Result<()> {
+        let (send, receive) = oneshot::channel();
+        let _ = self.sender.send(Command::Inhibit(send));
+        receive.await?
+    }
+    async fn uninhibit(&self) -> Result<()> {
+        let (send, receive) = oneshot::channel();
+        let _ = self.sender.send(Command::Uninhibit(send));
+        receive.await?
+    }
+}
+
+#[tokio::main]
 pub async fn start() -> Result<()> {
-    let system = zbus::Connection::system().await?;
-    let mut fd: Option<OwnedFd> = None;
-    let systemd_proxy = SystemdProxy::new(&system).await?;
     let socket_path = get_socket_path()?;
     if socket_path.try_exists()? {
         std::fs::remove_file(&socket_path)?;
         println!("Removed old socket");
     }
+    let inhibitor = Inhibitor::new_handler().await;
 
     let socket = UnixListener::bind(&socket_path)?;
-    for mut stream in socket.incoming().filter_map(|c| c.ok()) {
-        handle_connection(&mut stream, &systemd_proxy, &mut fd).await?;
+    loop {
+        let (stream, _) = socket.accept().await?;
+        tokio::spawn({
+            let inhibitor = inhibitor.clone();
+            async move {
+                let _ = handle_connection(stream, inhibitor).await;
+            }
+        });
     }
-    Ok(())
 }
 
-async fn handle_connection(
-    stream: &mut UnixStream,
-    proxy1: &SystemdProxy<'_>,
-    fd: &mut Option<OwnedFd>,
-) -> Result<()> {
-    match Signal::from_reader(stream) {
-        Err(_) => bail!("Failed to deserialize request"),
-        Ok(s) => match s {
+async fn handle_connection(stream: UnixStream, inhibitor: InhibitorHandler) -> Result<()> {
+    let test = Framed::new(stream, SignalCodec {});
+    let (mut write, mut read) = test.split();
+    if let Some(Ok(s)) = read.next().await {
+        match s {
             Signal::Query => {
-                if fd.is_some() {
-                    Signal::On.to_writer(stream)
+                if inhibitor.query().await? {
+                    write.send(Signal::On).await?;
                 } else {
-                    Signal::Off.to_writer(stream)
+                    write.send(Signal::Off).await?;
                 }
             }
             Signal::On => {
-                if fd.is_none() {
-                    let new_fd = proxy1
-                        .inhibit("idle", "inhibitor", "User request", "block")
-                        .await?;
-                    *fd = Some(new_fd);
-                }
-                Signal::On.to_writer(stream)
+                inhibitor.inhibit().await?;
+                write.send(Signal::On).await?;
             }
             Signal::Off => {
-                *fd = None;
-                Signal::Off.to_writer(stream)
+                inhibitor.uninhibit().await?;
+                write.send(Signal::Off).await?;
             }
-        },
+        }
     }
+    Ok(())
 }
