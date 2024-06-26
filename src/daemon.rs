@@ -96,7 +96,7 @@ impl InhibitorHandler {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 pub async fn start() -> Result<()> {
     let socket_path = get_socket_path()?;
     if socket_path.try_exists()? {

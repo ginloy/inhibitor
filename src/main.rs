@@ -34,7 +34,7 @@ pub enum Signal {
 fn main() -> Result<()> {
     let args = Cli::parse();
     let signal = args.command.unwrap_or(Signal::Query);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
