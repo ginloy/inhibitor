@@ -1,6 +1,6 @@
 use crate::codec::SignalCodec;
 use crate::{get_socket_path, Signal};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -44,12 +44,18 @@ impl Inhibitor {
                 let _ = ch.send(Ok(self.fd.is_some()));
             }
             Command::Inhibit(ch) => {
-                self.fd = proxy
+                match proxy
                     .inhibit("idle", "inhibitor", "User request", "block")
                     .await
-                    .ok();
-
-                let _ = ch.send(Ok(()));
+                {
+                    Ok(f) => {
+                        self.fd = Some(f);
+                        let _ = ch.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = ch.send(Err(anyhow!(e)));
+                    }
+                }
             }
             Command::Uninhibit(ch) => {
                 self.fd = None;
@@ -58,7 +64,7 @@ impl Inhibitor {
         }
     }
 
-    async fn new_handler() -> InhibitorHandler {
+    async fn spawn() -> InhibitorHandler {
         let (sender, receiver) = mpsc::unbounded_channel();
         let connection = zbus::Connection::system()
             .await
@@ -103,7 +109,7 @@ pub async fn start() -> Result<()> {
         std::fs::remove_file(&socket_path)?;
         println!("Removed old socket");
     }
-    let inhibitor = Inhibitor::new_handler().await;
+    let inhibitor = Inhibitor::spawn().await;
 
     let socket = UnixListener::bind(&socket_path)?;
     loop {
